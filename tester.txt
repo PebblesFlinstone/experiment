@@ -1,3 +1,1994 @@
-1 this is tester and this is from Pebbles. 
-2 line 2
-3 line 3
+try:
+    from cfgupd import *
+except:
+    pass
+from config import *
+
+from machine import UART, RTC, ADC, Pin, PWM, WDT, Timer
+if MACH.lower() != 'comlora':
+    from machine import I2C
+    from lis2hh12 import LIS2HH12
+from ubiwifi import UbiWiFi
+try:
+    from ubilorawan import UbiLoRaWan
+except:
+    from ubilte import UbiLTE
+from umqtt import MQTTClient, mqtt_urlparse
+from ubiLPP import UbiLPP
+import beacon
+import stpm34
+import schedule
+import pycom
+import logging
+import time
+import binascii
+import json
+import os
+import _thread
+import gc
+
+WD_TIMEOUT = 300000
+
+log = logging.getLogger(__name__)
+
+
+def randint(a, b):
+    import crypto
+    r = crypto.getrandbits(32)
+    return int((((r[0] << 24) + (r[1] << 16) + (r[2] << 8) + r[3]) / (2 ** 32 - 1.0)) * (b - a) + a)
+
+def clamp_stat_freq(freq):
+    if freq < 5:
+        freq = 5
+    if MACH.lower().startswith('comlora'):
+        if LORA_REGION.lower() == 'us915':
+            if freq < 30:
+                freq = 30
+        elif freq < 100:
+            # Enforce 1% TX duty cycle
+            freq = 100
+    return freq
+
+class UbiCell():
+    def __init__(self):
+        logging.basicConfig(level=logging.DEBUG)
+
+        log.debug('{} using MicroPython version {}'.format(MACH, MP_VER))
+        log.info('Firmware version {} starting...'.format(FW_VER))
+
+        # Watchdog timer.  Long timeout as some hardware can take a
+        # while to set up.
+        self.wdt = WDT(timeout=WD_TIMEOUT)
+        # Enable WDT on boot up too, in case we don't get run for some reason.
+        pycom.wdt_on_boot_timeout(600000)
+        pycom.wdt_on_boot(True)
+        log.info('WDT: Initialized')
+
+        # Store variables that can be changed at runtime in NVRAM.
+        if not pycom.nvs_get('stat_freq'):
+            pycom.nvs_set('stat_freq', clamp_stat_freq(STATUS_FREQ))
+        if pycom.nvs_get('lamp_th_on') is None:
+            pycom.nvs_set('lamp_th_on', LAMP_TH_ON)
+        if pycom.nvs_get('lamp_th_off') is None:
+            pycom.nvs_set('lamp_th_off', LAMP_TH_OFF)
+
+        # Pins here are indexed from 0 (zero) and referring to the breakout pins.
+        self.ALS_PIN = 'P6'
+        self.LAMP_RELAY_PIN = 'P10'
+        self.LAMP_PWM_PIN = 'P32'
+        self.LAMP_PWM2_PIN = 'P35'
+
+        if MACH.lower() != 'comlora':
+            self.i2c = I2C(0, mode=I2C.MASTER)
+        else:
+            self.i2c = None
+
+        self.adc = ADC()
+        self.adc_als = self.adc.channel(pin=self.ALS_PIN)
+
+        self.lamp_p_out = Pin(self.LAMP_RELAY_PIN, mode=Pin.OUT)
+        self.lamp_p_out(0)
+
+        self.lamp_pwm = PWM(0, frequency=5000)
+
+        lamp_lvl = pycom.nvs_get('lamp_lvl')
+        if lamp_lvl is None:
+            lamp_lvl = 100
+            pycom.nvs_set('lamp_lvl', lamp_lvl)
+        else:
+            log.info('Restoring last lamp dimmer state: {}'.format(lamp_lvl))
+        self.lamp_pwm_c = self.lamp_pwm.channel(0, pin=self.LAMP_PWM_PIN, duty_cycle=float(lamp_lvl) / 100)
+
+        lamp_lvl = pycom.nvs_get('lamp2_lvl')
+        if lamp_lvl is None:
+            lamp_lvl = 100
+            pycom.nvs_set('lamp2_lvl', lamp_lvl)
+        else:
+            log.info('Restoring last lamp 2 dimmer state: {}'.format(lamp_lvl))
+        self.lamp_pwm2_c = self.lamp_pwm.channel(1, pin=self.LAMP_PWM2_PIN, duty_cycle=float(lamp_lvl) / 100)
+
+        if pycom.nvs_get('lamp_latch'):
+            lamp_state = pycom.nvs_get('lamp_latch_s')
+            log.info('Restoring last lamp power state: {}'.format('ON' if lamp_state else 'OFF'))
+            if lamp_state:
+                self.lamp_p_out(1)
+        elif self.adc_als() <= pycom.nvs_get('lamp_th_on'):
+            self.lamp_p_out(1)
+
+        # DNS.
+        #
+        # Actually set just before MQTT connection.
+        self.dns_pri = ''
+        self.dns_sec = ''
+        try:
+            self.dns_pri = DNS_PRI
+            if self.dns_pri:
+                log.debug('Primary DNS: {}'.format(self.dns_pri))
+        except:
+            pass
+        try:
+            self.dns_sec = DNS_SEC
+            if self.dns_sec:
+                log.debug('Secondary DNS: {}'.format(self.dns_sec))
+        except:
+            pass
+
+        # WiFi.
+        self.wifi_nets = {}
+        try:
+            self.wifi_nets = json.loads(pycom.nvs_get('wifi_nets'))
+        except:
+            try:
+                # Migrate file to non-volatile storage.
+                with open('wifi_nets.txt', 'r') as f:
+                    self.wifi_nets = json.loads(f.readline())
+                os.remove('wifi_nets.txt')
+                log.debug('WiFi: Migrating nets to NVS.')
+            except:
+                # Use factory configured wifi nets.
+                self.wifi_nets = dict(WIFI_NETS)
+        if self.wifi_nets:
+            try:
+                pycom.nvs_set('wifi_nets', json.dumps(self.wifi_nets))
+            except Exception as e:
+                log.error('WiFi: Error storing nets: ' + repr(e))
+        self.wifi = UbiWiFi(self.wifi_nets)
+        self.wdt.feed()
+
+        # WiFi MAC address sniffing.
+        if pycom.nvs_get('sniffing') is None:
+            pycom.nvs_set('sniffing', int(WIFI_PROMISC))
+        if pycom.nvs_get('sniffing'):
+            self.wifi.set_promiscuous_cb(self._parse_mac)
+            self.wifi.set_promiscuous(True)
+        else:
+            self.wifi.set_promiscuous(False)
+        self.seen_macs = {}
+        self.wdt.feed()
+
+        # Scan for possible WiFi networks to connect to.
+        self.wifi.join()
+
+        # Bluetooth URIBeacon advertisements.
+        log.info('Beacon-URI: Initializing...')
+        self.beacon = beacon.Beacon()
+        beacon_uri = pycom.nvs_get('beacon_uri')
+        if not beacon_uri:
+            try:
+                # Migrate file to non-volatile storage.
+                with open('beacon_uri.txt', 'r') as f:
+                    beacon_uri = f.readline()
+                os.remove('beacon_uri.txt')
+                log.debug('Beacon-URI: Migrating to NVS.')
+            except:
+                # Use factory configured URI.
+                try:
+                    beacon_uri = BEACON_URI
+                except:
+                    pass
+        if beacon_uri:
+            beacon_uri = self.beacon.set_service_data(beacon_uri)
+            try:
+                pycom.nvs_set('beacon_uri', beacon_uri)
+                self.beacon.enable()
+                log.info('Beacon-URI: Advertising "{}".'.format(beacon_uri))
+            except Exception as e:
+                log.error('Beacon-URI: Error storing URI: ' + repr(e))
+        else:
+            log.warning('Beacon-URI: Not advertising.')
+
+        # LoRaWAN.
+        self.lorawan = None
+        if MACH.lower().startswith('comlora') and not WIFI_ONLY:
+            # XXX: Not yet implemented.
+            LORA_DWELL_LIMIT = False
+            # May not actually join here.
+            self.lorawan = UbiLoRaWan(LORA_ACTIVATION, \
+                    LORA_REGION, LORA_CHANNEL_PLAN, \
+                    LORA_CLASS, LORA_DR, LORA_ADR, \
+                    LORA_DWELL_LIMIT, \
+                    LORA_DEV_ADDR, LORA_NWK_SWKEY, LORA_APP_SWKEY, \
+                    LORA_DEV_EUI, LORA_APP_EUI, LORA_APP_KEY)
+            self.dev_eui = self.lorawan.get_eui()
+            self.lora_joined = False
+        else:
+            self.dev_eui = self.wifi.get_eui()
+        log.info('Device EUI is "{}"'.format(self.dev_eui))
+        self.wdt.feed()
+
+        # LTE.
+        # Connects in main loop.
+        self.lte = None
+        self.lte_conn_delay = 0
+        if not self.lorawan and not WIFI_ONLY:
+            lte_apn = pycom.nvs_get('lte_apn')
+            if not lte_apn:
+                try:
+                    # Migrate file to non-volatile storage.
+                    with open('lte_apn.txt', 'r') as f:
+                        lte_apn = f.readline()
+                    os.remove('lte_apn.txt')
+                    log.debug('LTE: Migrating APN to NVS.')
+                except:
+                    # Use factory configured APN.
+                    lte_apn = LTE_APN
+            if lte_apn:
+                try:
+                    pycom.nvs_set('lte_apn', lte_apn)
+                    log.info('LTE: Set APN to "{}".'.format(lte_apn))
+                except Exception as e:
+                    log.error('LTE: Error storing APN: ' + repr(e))
+            mcc_mnc = ''
+            bands = ''
+            scanseq = ''
+            scanmode = ''
+            iotopmode = ''
+            try:
+                mcc_mnc = LTE_MCC_MNC
+            except:
+                pass
+            try:
+                bands = LTE_BANDS
+            except:
+                pass
+            try:
+                scanseq = LTE_SCANSEQ
+            except:
+                pass
+            try:
+                scanmode = LTE_SCANMODE
+            except:
+                pass
+            try:
+                iotopmode = LTE_IOTOPMODE
+            except:
+                pass
+            self.lte = UbiLTE(MACH, \
+                    lte_apn, LTE_USER, LTE_PASS, \
+                    LTE_CARRIER_ID, mcc_mnc, \
+                    bands, scanseq, scanmode, iotopmode)
+        self.wdt.feed()
+
+        self.report_asap = False
+        self.rat = None
+        self.csq = None
+
+        # RTC.  Time sync is handled in main loop.
+        self.rtc = RTC()
+        self.ntp_syncing = False
+        self.wdt.feed()
+
+        # GNSS.
+        log.info('GNSS: Initializing...')
+        self.rtc_set = ()
+        self.rtc_jamset = True
+        self.gps_fix = 0
+        self.gps_sats = []
+        self.gps_report = False
+        if pycom.nvs_get('gps_report') is None:
+            pycom.nvs_set('gps_report', int(GPS_REPORT))
+        self.mpy_gps = None
+        if pycom.nvs_get('gps_lat') is None:
+            pycom.nvs_set('gps_lat', 0)
+        if pycom.nvs_get('gps_lon') is None:
+            pycom.nvs_set('gps_lon', 0)
+        if pycom.nvs_get('gps_hdop') is None:
+            pycom.nvs_set('gps_hdop', 0)
+        self.gps_lat = self.cur_gps_lat = 0.0
+        self.gps_lon = self.cur_gps_lon = 0.0
+        self.gps_hdop = self.cur_gps_hdop = 0.0
+        self.gps_uart = None
+        self.gps_i2c = False
+        gps_module = ''
+        i = 4
+        while self.i2c and i:
+            try:
+                self.i2c.writeto(0x10, bytearray(1))
+                gps_module = 'Quectel L96'
+                self.gps_i2c = True
+                break
+            except:
+                i -= 1
+                time.sleep_ms(200)
+        else:
+            if GPS_BAUD:
+                self.gps_uart = UART(GPS_UART, GPS_BAUD)
+                gps_module = 'Quectel L80'
+        if gps_module:
+            from micropyGPS import MicropyGPS
+            self.mpy_gps = MicropyGPS(location_formatting='dd')
+            log.info('GNSS: Initialized using {} module.'.format(gps_module))
+        elif MACH.lower() == 'comlteqt':
+            self.lte.set_gps_callback(self._gps_updated_cb)
+            log.info('GNSS: Initialized using Quectel LTE module.')
+        else:
+            log.error('GNSS: Failed to initialize.')
+        self.wdt.feed()
+
+        # Tilt sensor (LIS2HH12).
+        self.tilt_sensor = None
+        log.info('LIS2HH12: Initializing...')
+        tilt_th = 5
+        try:
+            tilt_th = TILT_THRESHOLD
+        except:
+            pass
+        if pycom.nvs_get('tilt_th') is None:
+            pycom.nvs_set('tilt_th', tilt_th)
+        i = 4
+        while self.i2c and i:
+            try:
+                self.tilt_sensor = LIS2HH12(i2c=self.i2c)
+                log.info('LIS2HH12: Initialized (ID={}).'.format(hex(self.tilt_sensor.whoami)))
+                log.info('LIS2HH12: Tilt threshold: {} degrees'.format(pycom.nvs_get('tilt_th')))
+                self.tilt = self.tilt_last = self.tilt_sensor.acceleration
+                break
+            except:
+                i -= 1
+                time.sleep_ms(200)
+        else:
+            if MACH.lower() == 'comlora':
+                log.error('LIS2HH12: Not present.')
+            else:
+                log.error('LIS2HH12: Failed to initialize.')
+        self.wdt.feed()
+
+        # Power metering (STPM34).
+        self.stpm = None
+        self.meter_v1 = -1
+        self.meter_c1 = -1
+        self.meter_v2 = -1
+        self.meter_c2 = -1
+        self.cma_meter_v1 = 0
+        self.cma_meter_c1 = 0
+        self.cma_meter_v2 = 0
+        self.cma_meter_c2 = 0
+        self.cma_meter_count = 0
+        if METER_UART_BAUD:
+            log.info('STPM34: Initializing...')
+            meter_th_hi = 600
+            meter_th_lo = 90
+            try:
+                meter_th_hi = METER_THRESHOLD_HI
+                meter_th_lo = METER_THRESHOLD_LO
+            except:
+                pass
+            if pycom.nvs_get('meter_th_hi') is None:
+                pycom.nvs_set('meter_th_hi', meter_th_hi)
+            if pycom.nvs_get('meter_th_lo') is None:
+                pycom.nvs_set('meter_th_lo', meter_th_lo)
+            if pycom.nvs_get('meter_report') is None:
+                pycom.nvs_set('meter_report', int(METER_REPORT))
+            try:
+                self.stpm = stpm34.STPM34(METER_UART_PORT, METER_UART_BAUD, METER_FREQ)
+                log.info('STPM34: Initialized.')
+                log.info('STPM34: Line voltage swell threshold: {}V'.format(pycom.nvs_get('meter_th_hi')))
+                log.info('STPM34: Line voltage sag threshold: {}V'.format(pycom.nvs_get('meter_th_lo')))
+            except:
+                log.error('STPM34: Failed to initialize.')
+        self.wdt.feed()
+
+        # Schedule.
+        log.info('Schedule: Delaying initialization until time is set.')
+        self.sched_init = False
+        self.wdt.feed()
+
+        # MQTT.
+        self.mqttc = None
+        self.mqtt_addr = None
+        log.info('MQTT: Initializing...')
+        mqtt_url = pycom.nvs_get('mqtt_url')
+        if not mqtt_url:
+            try:
+                # Migrate file to non-volatile storage.
+                with open('mqtt_url.txt', 'r') as f:
+                    mqtt_url = f.readline()
+                os.remove('mqtt_url.txt')
+                log.debug('MQTT: Migrating URL to NVS.')
+            except:
+                pass
+        try:
+            pycom.nvs_set('mqtt_url', mqtt_url)
+            mqtt_url = mqtt_urlparse(mqtt_url)
+            self.mqtt_user = mqtt_url[1]
+            self.mqtt_pass = mqtt_url[2]
+            self.mqtt_addr = mqtt_url[3]
+            self.mqtt_port = mqtt_url[4]
+        except:
+            # Use factory configured URL.
+            try:
+                self.mqtt_user = MQTT_USER
+                self.mqtt_pass = MQTT_PASS
+                self.mqtt_addr = MQTT_ADDR
+                self.mqtt_port = MQTT_PORT
+            except:
+                log.warning('MQTT: Not configured.')
+        heartbeat = 1200
+        try:
+            heartbeat = MQTT_HEARTBEAT
+        except:
+            pass
+        if not pycom.nvs_get('mqtt_ping'):
+            pycom.nvs_set('mqtt_ping', heartbeat)
+        if self.mqtt_addr:
+            try:
+                self.mqttc = MQTTClient(self.dev_eui, \
+                        self.mqtt_addr, self.mqtt_port, \
+                        self.mqtt_user, self.mqtt_pass)
+                self.MQTT_TOP_PUB = 'ubicell/{}/rx'.format(self.dev_eui)
+                self.MQTT_TOP_SUB = 'ubicell/{}/tx'.format(self.dev_eui)
+                self.mqttc.set_callback(self._mqtt_sub_cb)
+                log.info('MQTT: Initialized.')
+            except:
+                log.error('MQTT: Failed to initialize.')
+        self.wdt.feed()
+
+        # Ubicquia Low Power Packet.
+        self.lpp = UbiLPP()
+        self.lpp_segment = 1
+
+        # Firmware updates.
+        self.fw_upd_url = None
+        self.fw_upd_lock = _thread.allocate_lock()
+        self.reboot_lock = _thread.allocate_lock()
+
+        # Third party sensors.
+        self.aqy_cookie = {}
+        self.aq_data = {}
+        self.gsd_data = {}
+
+        gc.collect()
+        log.info('Device initialization complete.  Free memory: {} bytes'.format(gc.mem_free()))
+
+
+    def _parse_mac(self, rssi, payload):
+        try:
+            mac = binascii.hexlify(payload[10:16]).decode('ascii')
+            if mac not in self.seen_macs:
+                # Record timestamp the first time we see a MAC address.
+                self.seen_macs[mac] = [time.time(), rssi]
+            elif self.seen_macs[mac][1] != 0:
+                # Update RSSI if MAC not yet transmitted.
+                self.seen_macs[mac][1] = rssi
+        except:
+            # Can't raise any exceptions here.
+            pass
+
+    def prune_macs(self):
+        if not self.seen_macs:
+            return
+
+        # Expire old MAC addresses.
+        self.seen_macs = {k: v for k, v in self.seen_macs.items() if time.time() - v[0] < 30}
+
+        # Only keep at most 50 MAC addresses in memory.
+        sorted_macs = [t[0] for t in sorted(self.seen_macs.items(), key=lambda x: x[1][0])]
+        while len(self.seen_macs) > 50 and len(sorted_macs):
+            self.seen_macs.pop(sorted_macs[0], None)
+            del sorted_macs[0]
+
+    def build_mac_msg(self):
+        if not self.lte or not self.lte.isconnected() or not pycom.nvs_get('sniffing'):
+            return False
+
+        rv = False
+        saved_chans = self.lpp.get_payload_chans()
+        self.lpp.reset_payload()
+        self.lpp.reset_payload_chans()
+        try:
+            self.lpp.add_generic(DEV_NODE, 'n')
+            for mac in self.seen_macs.keys():
+                # Only transmit a given MAC at most every 30 seconds.
+                if self.seen_macs[mac][1] != 0 and time.time() - self.seen_macs[mac][0] < 30:
+                    # Payload max size must be >= 27 bytes:
+                    # 6+2 bytes for M1, 4+2 bytes for M2, 1+2 bytes for Mq, 8+2 bytes for n.
+                    if self.lpp.get_size() >= 27:
+                        if self.lpp.is_within_size_limit(15): # 17 - 2
+                            self.lpp.add_generic(int(mac[0:8], 16), 'M1')
+                            self.lpp.add_generic(int(mac[8:12], 16), 'M2')
+                            self.lpp.add_generic(self.seen_macs[mac][1], 'Mq')
+                        else:
+                            break
+                        if self.lpp.payload_chan_find('M1') and \
+                           self.lpp.payload_chan_find('M2') and \
+                           self.lpp.payload_chan_find('Mq'):
+                            self.lpp.payload_chan_clear('M1')
+                            self.lpp.payload_chan_clear('M2')
+                            self.lpp.payload_chan_clear('Mq')
+                        self.seen_macs[mac][1] = 0 # Mark it as transmitted.
+                        rv = True
+        except Exception as e:
+            # payload at max size
+            log.warning(e)
+        self.lpp.set_payload_chans(saved_chans)
+        return rv
+
+    def reboot(self):
+        # Reboot machine.
+        if not self.reboot_lock.acquire(0):
+            return False
+
+        # Stops feeding external watchdog, so this is a hard power cycle.
+        from machine import EXTWDT
+        extwdt = EXTWDT()
+        log.info('REBOOTING.')
+        extwdt.deinit()
+        # Just in case external watchdog fails or isn't present.
+        self.wdt.init(30000)
+        self.wdt.feed()
+        return True
+
+    def fw_update_status_cb(self):
+        self.lamp_p_out.toggle()
+
+    def fw_update(self, url):
+        with self.fw_upd_lock:
+            from ota import OTA
+            ota = OTA(url)
+            ota.set_status_callback(self.fw_update_status_cb)
+            manifest = None
+            try:
+                manifest = ota.get_update_manifest(MACH, FW_VER)
+            except Exception as e:
+                log.error('Unable to get update manifest: ' + repr(e))
+            if manifest:
+                log.info('Firmware version {} available.'.format(manifest['version']))
+
+                gc.collect()
+                log.debug('Free memory: {} bytes'.format(gc.mem_free()))
+
+                ota.update(manifest)
+                return True
+            else:
+                del manifest
+                del ota
+                return False
+
+    def lamp_toggle(self, onoff, latch=True):
+        if onoff:
+            onoff = 1
+        else:
+            onoff = 0
+
+        if self.lamp_p_out() != onoff:
+            self.reset_meter_cma()
+            self.report_asap = True
+
+        self.lamp_p_out(onoff)
+
+        if latch:
+            # Store current lamp state and latch it until the next
+            # automatic transition, where the latch will be cleared.
+            pycom.nvs_set('lamp_latch', 1)
+            pycom.nvs_set('lamp_latch_s', onoff)
+            pycom.nvs_set('lamp_latch_n', int(self.adc_als() <= pycom.nvs_get('lamp_th_on')))
+
+    def lamp_dim(self, lvl):
+        pwm_c = self.lamp_pwm_c
+        pwm_v = 'lamp_lvl'
+        if 100 < lvl < 202:
+            # Set dimmer level of second PWM channel.
+            pwm_c = self.lamp_pwm2_c
+            pwm_v = 'lamp2_lvl'
+            lvl -= 101
+        elif lvl < 0:
+            lvl = 0
+        elif lvl > 100:
+            lvl = 100
+
+        pwm_c.duty_cycle(float(lvl) / 100)
+        pycom.nvs_set(pwm_v, lvl)
+        self.report_asap = True
+
+    def cron_str_to_schedule(self, cron_str):
+        def cron_job(d):
+            if 0 < d < 5:
+                # d == 1: toggle lamp off
+                # 1 < d < 5: toggle lamp on
+                self.lamp_toggle(d - 1)
+            else:
+                # d == 0 or d >= 5
+                self.lamp_dim(d)
+
+        cron_id = int(cron_str.split()[0])
+        cron_time = cron_str.split()[1]
+        cron_time = cron_time.split(':')[0] + ":" + cron_time.split(':')[1]
+        cron_dow = cron_str.split()[2]
+        cron_d = int(cron_str.split()[3])
+
+        for job in schedule.jobs[:]:
+            if job.id == cron_id:
+                schedule.cancel_job(job)
+
+        if '1' in cron_dow:
+            schedule.every(idNo=cron_id).monday.at(cron_time).do(cron_job, cron_d)
+        if '2' in cron_dow:
+            schedule.every(idNo=cron_id).tuesday.at(cron_time).do(cron_job, cron_d)
+        if '3' in cron_dow:
+            schedule.every(idNo=cron_id).wednesday.at(cron_time).do(cron_job, cron_d)
+        if '4' in cron_dow:
+            schedule.every(idNo=cron_id).thursday.at(cron_time).do(cron_job, cron_d)
+        if '5' in cron_dow:
+            schedule.every(idNo=cron_id).friday.at(cron_time).do(cron_job, cron_d)
+        if '6' in cron_dow:
+            schedule.every(idNo=cron_id).saturday.at(cron_time).do(cron_job, cron_d)
+        if '7' in cron_dow or '0' in cron_dow:
+            schedule.every(idNo=cron_id).sunday.at(cron_time).do(cron_job, cron_d)
+
+    def cron_del(self, cron_str=''):
+        if not cron_str:
+            log.debug('Schedule: Clearing all schedules.')
+            with open('crontab.txt', 'w'):
+                pass
+            schedule.clear()
+            return
+
+        with open('crontab.txt', 'r') as inFile, open('crontab.tmp', 'w') as outFile:
+            for line in inFile:
+                if line.split()[0] == cron_str.split()[0]:
+                    for job in schedule.jobs[:]:
+                        if job.id == int(cron_str.split()[0]):
+                            schedule.cancel_job(job)
+                    log.debug('Schedule: [-] {}'.format(line.rstrip()))
+                else:
+                    outFile.write(line)
+                    log.debug('Schedule: [ ] {}'.format(line.rstrip()))
+        os.remove('crontab.txt')
+        os.rename('crontab.tmp', 'crontab.txt')
+
+    def cron_add(self, cron_str):
+        with open('crontab.txt', 'a') as f:
+            f.write(cron_str + '\r\n')
+        if self.sched_init:
+            self.cron_str_to_schedule(cron_str)
+        log.debug('Schedule: [+] {}'.format(cron_str))
+
+    # Expects JSON string with no padding or surrounding braces.
+    def _rx_control_cb(self, rx_data):
+        msg = rx_data.decode('ascii')
+
+        # Values can contain both colons and commas and are not quoted,
+        # making them difficult to parse.  Replace commas in values with
+        # semicolons temporarily to make the dict comprehension easier.
+        #
+        # Note that this means semicolons are forbidden in the commands!
+        m = []
+        for p in msg.split(','):
+            if p.find(':') < 0:
+                m[-1] += ';' + p
+            else:
+                m.append(p)
+        msg = ','.join(m)
+        del m
+
+        cmd = {p.split(':')[0].strip(): p.split(':', 1)[1].strip() for p in msg.split(',')}
+
+        cmd = {k: v.replace(';', ',') for k, v in cmd.items()}
+
+        # Send an uplink message ASAP after receiving a command.
+        self.report_asap = True
+
+        log.debug('RX: {}'.format(cmd))
+        if 't' in cmd:
+            if 'd' in cmd and cmd['t'] == '0':
+                # Turn lamp on/off.
+                self.lamp_toggle(int(cmd['d']))
+            elif 'd' in cmd and cmd['t'] == '1':
+                # Set lamp dimmer level.
+                self.lamp_dim(int(cmd['d']))
+            elif cmd['t'] == '2':
+                # Set lamp on threshold.
+                #
+                # If 'd' is omitted, reset to factory configuration.
+                d = int(cmd.get('d', LAMP_TH_ON))
+                if d < 0:
+                    d = 0
+                elif d > 4095:
+                    d = 4095
+                pycom.nvs_set('lamp_th_on', d)
+            elif cmd['t'] == '3':
+                # Set lamp off threshold.
+                #
+                # If 'd' is omitted, reset to factory configuration.
+                d = int(cmd.get('d', LAMP_TH_OFF))
+                if d < 0:
+                    d = 0
+                elif d > 4095:
+                    d = 4095
+                pycom.nvs_set('lamp_th_off', d)
+            elif cmd['t'] == '4':
+                # Set status report frequency (in seconds).
+                #
+                # If 'd' is omitted, reset to factory configuration.
+                d = clamp_stat_freq(int(cmd.get('d', STATUS_FREQ)))
+                pycom.nvs_set('stat_freq', d)
+            elif 'd' in cmd and cmd['t'] == '5':
+                # Add scheduled job.
+                try:
+                    self.cron_del(cmd['d'])
+                    if schedule.num_jobs() < 8:
+                        self.cron_add(cmd['d'])
+                except Exception as e:
+                    log.error('Schedule: Add: ' + repr(e))
+            elif cmd['t'] == '6':
+                # Delete scheduled job.
+                # If 'd' is omitted, will clear all schedules.
+                try:
+                    self.cron_del(cmd.get('d', ''))
+                except Exception as e:
+                    log.error('Schedule: Del: ' + repr(e))
+            elif cmd['t'] == '7':
+                # WiFi promiscuous mode (footfall).
+                #
+                # If 'd' is omitted, reset to factory configuration.
+                self.seen_macs = {}
+                d = int(cmd.get('d', WIFI_PROMISC))
+                if pycom.nvs_get('sniffing') != d:
+                    log.info('{} WiFi promiscuous mode.'.format('Enabling' if d else 'Disabling'))
+                    pycom.nvs_set('sniffing', d)
+                    # Reboot machine.
+                    if not self.fw_upd_lock.locked():
+                        self.reboot()
+            elif cmd['t'] == '8':
+                # Set URIBeacon adv data.
+                #
+                # If 'd' is omitted, reset to factory configuration and disable.
+                if cmd.get('d'):
+                    beacon_uri = self.beacon.set_service_data(cmd['d'])
+                    try:
+                        pycom.nvs_set('beacon_uri', beacon_uri)
+                    except Exception as e:
+                        log.error('Beacon-URI: Error storing URI: ' + repr(e))
+                    else:
+                        log.info('Beacon-URI: Stored new URI successfully.')
+                        self.beacon.enable()
+                        log.info('Beacon-URI: Advertising "{}".'.format(beacon_uri))
+                else:
+                    try:
+                        pycom.nvs_erase('beacon_uri')
+                    except:
+                        pass
+                    else:
+                        self.beacon.disable()
+                        log.info('Beacon-URI: Disabled.')
+            elif cmd['t'] == '9':
+                # Set MQTT heartbeat (ping) frequency (in seconds).
+                #
+                # If 'd' is omitted, reset to factory configuration.
+                d = int(cmd.get('d', MQTT_HEARTBEAT))
+                if d <= 0:
+                    d = 0
+                    log.info('MQTT: heartbeat disabled.')
+                else:
+                    log.info('MQTT: heartbeat every {} seconds.'.format(d))
+                pycom.nvs_set('mqtt_ping', d)
+            elif cmd['t'] == '10':
+                # Set MQTT URL.
+                #
+                # If 'd' is omitted, reset to factory configuration.
+                if cmd.get('d'):
+                    mqtt_url = mqtt_urlparse(cmd['d'])
+                    try:
+                        log.info('MQTT: Redirecting to "{}".'.format(cmd['d']))
+                        pycom.nvs_set('mqtt_url', mqtt_url)
+                    except Exception as e:
+                        log.error('MQTT: Error storing URL: ' + repr(e))
+                    else:
+                        log.info('MQTT: Stored new URL successfully.')
+                else:
+                    try:
+                        pycom.nvs_erase('mqtt_url')
+                    except:
+                        pass
+                    else:
+                        log.info('MQTT: Restoring factory URL.')
+                # Reboot machine.
+                if not self.fw_upd_lock.locked():
+                    self.reboot()
+            elif cmd['t'] == '11':
+                # Toggle reporting of GNSS data (La, Lo, Lh).
+                #
+                # If 'd' is omitted, reset to factory configuration.
+                pycom.nvs_set('gps_report', int(cmd.get('d', GPS_REPORT)))
+                self.gps_report = pycom.nvs_get('gps_report')
+            elif cmd['t'] == '12':
+                # Toggle reporting of meter data (V1, C1, C).
+                #
+                # If 'd' is omitted, reset to factory configuration.
+                pycom.nvs_set('meter_report', int(cmd.get('d', METER_REPORT)))
+            elif cmd['t'] == '13':
+                # Set LTE APN.
+                #
+                # If 'd' is omitted, reset to factory configuration.
+                if cmd.get('d'):
+                    log.info('LTE: Setting APN to "{}".'.format(cmd['d']))
+                    try:
+                        pycom.nvs_set('lte_apn', cmd['d'])
+                    except Exception as e:
+                        log.error('LTE: Error storing APN: ' + repr(e))
+                    else:
+                        log.info('LTE: Stored new APN successfully.')
+                else:
+                    try:
+                        pycom.nvs_erase('lte_apn')
+                    except:
+                        pass
+                    else:
+                        log.info('LTE: Restoring factory APN.')
+            elif cmd['t'] == '14':
+                # Set WiFi network to use for message transmission.
+                #
+                # 'd' field is a comma-separated SSID and pass pair.
+                # This means the SSID _cannot_ contain a comma!
+                #
+                # If 'd' is omitted, reset to factory configuration.
+
+                # Clear out existing internet-enabled networks first.
+                self.wifi_nets = {k: v for k, v in self.wifi_nets.items() if not v['inet']}
+
+                p = cmd.get('d', '').split(',', 1)
+                if len(p) == 2:
+                    # Add new network.
+                    self.wifi_nets[p[0]] = {'pwd': p[1], 'inet': True}
+                else:
+                    # Restore factory internet-enabled networks.
+                    for k, v in WIFI_NETS.items():
+                        if 'inet' in WIFI_NETS and v['inet']:
+                            self.wifi_nets[k] = v
+
+                try:
+                    pycom.nvs_set('wifi_nets', json.dumps(self.wifi_nets))
+                except Exception as e:
+                    log.error('WiFi: Error storing nets: ' + repr(e))
+                else:
+                    self.wifi.set_join_nets(self.wifi_nets)
+            elif cmd['t'] == '15':
+                # Set WiFi network to use for external sensor data.
+                #
+                # 'd' field is a comma-separated SSID and pass pair.
+                # This means the SSID _cannot_ contain a comma!
+                #
+                # If 'd' is omitted, reset to factory configuration.
+
+                # Clear out existing sensor networks first.
+                self.wifi_nets = {k: v for k, v in self.wifi_nets.items() if v['inet']}
+
+                p = cmd.get('d', '').split(',', 1)
+                if len(p) == 2:
+                    # Add new network.
+                    self.wifi_nets[p[0]] = {'pwd': p[1], 'inet': False}
+                else:
+                    # Restore factory sensor networks.
+                    for k, v in WIFI_NETS.items():
+                        if not 'inet' in v or not v['inet']:
+                            self.wifi_nets[k] = v
+
+                try:
+                    pycom.nvs_set('wifi_nets', json.dumps(self.wifi_nets))
+                except Exception as e:
+                    log.error('WiFi: Error storing nets: ' + repr(e))
+                else:
+                    self.wifi.set_join_nets(self.wifi_nets)
+            elif cmd['t'] == '50':
+                # Set tilt report threshold (in degrees).
+                #
+                # If 'd' is omitted, reset to factory configuration.
+                d = int(cmd.get('d', TILT_THRESHOLD))
+                if d <= 0:
+                    d = 0
+                    log.info('LIS2HH12: Tilt threshold disabled.')
+                else:
+                    log.info('LIS2HH12: Tilt threshold set to {} degrees.'.format(d))
+                pycom.nvs_set('tilt_th', d)
+            elif cmd['t'] == '51':
+                # Line voltage high threshold (in volts).
+                #
+                # If 'd' is omitted, reset to factory configuration.
+                d = int(cmd.get('d', METER_THRESHOLD_HI))
+                if d < 85:
+                    d = 85
+                pycom.nvs_set('meter_th_hi', d)
+                log.info('STPM34: Line voltage swell threshold set to {}V.'.format(d))
+            elif cmd['t'] == '52':
+                # Line voltage low threshold (in volts).
+                #
+                # If 'd' is omitted, reset to factory configuration.
+                d = int(cmd.get('d', METER_THRESHOLD_LO))
+                if d < 85:
+                    d = 85
+                pycom.nvs_set('meter_th_lo', d)
+                log.info('STPM34: Line voltage sag threshold set to {}V.'.format(d))
+            elif 'd' in cmd and cmd['t'] == '98':
+                if self.wifi.isconnected_inet() or \
+                        self.wifi.isconnected_cfg() or \
+                        (self.lte and self.lte.isconnected()):
+                    # UBI-XXX: This would be ideal, but not sure we have
+                    # enough heap memory, so let's play it safe and do this
+                    # in the main loop for now.
+                    #_thread.start_new_thread(self.fw_update, (cmd['d'],))
+                    if self.fw_upd_lock.acquire():
+                        self.fw_upd_url = cmd['d']
+                        self.fw_upd_lock.release()
+            elif cmd['t'] == '99':
+                # Reboot machine.
+                if not self.fw_upd_lock.locked():
+                    self.reboot()
+
+    def _mqtt_sub_cb(self, topic, msg):
+        if topic == self.MQTT_TOP_SUB.encode('utf-8'):
+            gc.collect()
+            j = json.loads(msg)
+            r = binascii.a2b_base64(j["payload"])
+            del j
+            self._rx_control_cb(r)
+
+    def _read_ext_sensors(self, host, timeout=5):
+        import urequests as requests
+
+        # Gun Shot Detector.
+        if 'GSD-' in self.wifi.get_net():
+            log.info('Querying Gun Shot Detector...')
+            try:
+                r = requests.get('http://%s/ubi' % (host), timeout=timeout)
+                self.gsd_data = r.json()
+                log.debug('GSD RX: {}'.format(self.gsd_data))
+                r.close()
+            except OSError as e:
+                log.error('Error querying GSD: ' + repr(e))
+                self.wifi.disconnect()
+            except Exception as e:
+                log.error('Error querying GSD: ' + repr(e))
+
+        # Air Quality (uRADMonitor A3)
+        elif 'uRADMonitor-' in self.wifi.get_net():
+            log.info('Querying uRADMonitor A3...')
+            try:
+                r = requests.get('http://%s/j' % (host), timeout=timeout)
+                if r.status_code == 200:
+                    self.aq_data = r.json()['data']
+                    # Divide value by 100 to convert Pa into hPa
+                    # (data comes in as Pa and must be sent out in units of hPa)
+                    self.aq_data['pressure'] /= 100.0
+                    # Divide by 1000 to convert PPB to PPM
+                    # (data comes in as PPB and must be sent out in unis of PPM)
+                    self.aq_data['voc'] /= 1000.0
+                    # Rename these keys to be consistent with Aeroqual AQY.
+                    self.aq_data['PM2.5'] = self.aq_data.pop('pm25', None)
+                    self.aq_data['PM10'] = self.aq_data.pop('pm10', None)
+                    self.aq_data['PM1'] = self.aq_data.pop('pm1', None)
+                    self.aq_data['O3'] = self.aq_data.pop('o3', None)
+                    self.aq_data['TEMP'] = self.aq_data.pop('temperature', None)
+                    self.aq_data['RH'] = self.aq_data.pop('humidity', None)
+                r.close()
+                log.debug('AQ: RX: {}'.format(self.aq_data))
+            except OSError as e:
+                log.error('Error querying uRADMonitor A3: ' + repr(e))
+                self.wifi.disconnect()
+            except Exception as e:
+                log.error('Error querying uRADMonitor A3: ' + repr(e))
+
+        # Air Quality (Aeroqual AQY).
+        elif 'AQY - ' in self.wifi.get_net():
+            log.info('Querying Aeroqual AQY...')
+            if not self.aqy_cookie:
+                # User/pass shouldn't be hard-coded, but this is all a temporary
+                # solution anyway.
+                try:
+                    r = requests.post('http://%s/api/account/login' % (host),
+                                      json=json.loads('{"UserName": "administrator", "Password": "aqmadmin"}'),
+                                      headers_want=['Set-Cookie'],
+                                      timeout=timeout)
+                    self.aqy_cookie = {'Cookie': r.headers['Set-Cookie']}
+                    log.debug('AQ: Got auth token "{}"'.format(self.aqy_cookie['Cookie']))
+                    r.close()
+                except OSError as e:
+                    log.error('Error querying AQ: ' + repr(e))
+                    self.wifi.disconnect()
+                except Exception as e:
+                    log.error('Error querying AQ: ' + repr(e))
+            aqy_serial = ''
+            if self.aqy_cookie:
+                log.debug('AQ: Fetching instruments...')
+                try:
+                    r = requests.get('http://%s/api/instrument' % (host),
+                                     headers=self.aqy_cookie,
+                                     headers_want=['Date'],
+                                     timeout=timeout)
+                    if r.status_code != 200:
+                        self.aqy_cookie = {}
+                    else:
+                        aqy_serial = r.json()[0]
+                        log.debug('AQ: Found instrument {}'.format(aqy_serial))
+                    r.close()
+                except OSError as e:
+                    log.error('Error querying AQ: ' + repr(e))
+                    self.wifi.disconnect()
+                except Exception as e:
+                    log.error('Error querying AQ: ' + repr(e))
+            if aqy_serial:
+                # Lack of strptime() is highly annoying...
+                #
+                # This will only work if the date format never changes; e.g.,
+                # possibly if interface is localized to something else.
+                months = [None, "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                          "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+                hdr_date = r.headers['Date'].replace(':', ' ')
+                telems = [e.strip(', ') for e in hdr_date.split(' ')]
+                del hdr_date
+                if len(telems) == 8:
+                    aqy_st = (
+                        # Year
+                        int(telems[3]),
+                        # Month
+                        months.index(telems[2]),
+                        # Day
+                        int(telems[1]),
+                        # Hour
+                        int(telems[4]),
+                        # Minute
+                        int(telems[5]),
+                        # Second
+                        int(telems[6])
+                    )
+                    del telems
+                    del months
+                    aqy_hour = aqy_st[3]
+                    aqy_fdate = '{}-{:02d}-{:02d}'.format(aqy_st[0], aqy_st[1], aqy_st[2] if aqy_hour > 0 else aqy_st[2] - 1)
+                    aqy_tdate = '{}-{:02d}-{:02d}'.format(aqy_st[0], aqy_st[1], aqy_st[2])
+                    aqy_fdate += 'T{:02d}:00:00'.format(aqy_hour - 1 if aqy_hour > 0 else 23)
+                    aqy_tdate += 'T{:02d}:{:02d}:{:02d}'.format(aqy_hour, aqy_st[4], aqy_st[5])
+                    del aqy_st
+
+                    try:
+                        r_url = 'http://{}/api/data/{}?from={}&to={}&averagingperiod=15'.format(host, aqy_serial, aqy_fdate, aqy_tdate)
+                        log.debug('AQ: Fetching data for {} from {}'.format(aqy_serial, r_url))
+                        r = requests.get(str(r_url).replace(' ', '%' + '20'),
+                                         headers=self.aqy_cookie, timeout=timeout)
+                        if r.status_code == 200:
+                            self.aq_data = r.json()['data'][-1]
+                            for k, v in self.aq_data.items():
+                                self.aq_data[k.strip()] = v
+                            log.debug('AQ: RX: {}'.format(self.aq_data))
+                        r.close()
+                    except OSError as e:
+                        log.error('Error querying AQ: ' + repr(e))
+                        self.wifi.disconnect()
+                    except Exception as e:
+                        log.error('Error querying AQ: ' + repr(e))
+
+    # Reset Cumulative Moving Average for meter data.
+    def reset_meter_cma(self):
+        self.cma_meter_v1 = 0
+        self.cma_meter_c1 = 0
+        self.cma_meter_v2 = 0
+        self.cma_meter_c2 = 0
+        self.cma_meter_count = 0
+
+    # Construct status message from sensor data.
+    def build_status_msg(self):
+        if self.lorawan:
+            self.lpp.set_size(self.lorawan.get_max_payload_size())
+        else:
+            self.lpp.set_size(1000)
+
+        self.lpp.reset_payload()
+
+        if self.lpp.payload_chans_left():
+            if self.lpp.get_size() >= 14: # max data size (9) + 1 + overhead (2 bytes/sensor)
+                # Send 'LP' with every segment.
+                try:
+                    self.lpp.payload_chan_clear('LP')
+                except ValueError:
+                    pass
+            if self.lpp.get_size() >= 24: # 14 + name size + 2 bytes overhead
+                # Send 'n' with every segment.
+                try:
+                    self.lpp.payload_chan_clear('n')
+                except ValueError:
+                    pass
+        else:
+            self.lpp_segment = 1
+            self.lpp.reset_payload_chans()
+
+        # These are never sent here.
+        self.lpp.payload_chan_skip('M1')
+        self.lpp.payload_chan_skip('M2')
+        self.lpp.payload_chan_skip('Mq')
+
+        try:
+            # Device name
+            if self.mqttc and self.mqttc.isconnected():
+                # Only need 'n' field to MQTT broker.
+                self.lpp.add_generic(DEV_NODE, 'n')
+            else:
+                # COMLORA does not need to send 'n' field.
+                self.lpp.payload_chan_skip('n')
+
+            # "Last Gasp"
+            #
+            # If line voltage is exactly zero, we've lost power.
+            # Send V ASAP to help guarantee it makes it to the server before
+            # capacitor drains.
+            if self.meter_v1 == 0:
+                self.lpp.add_voltage(self.meter_v1, 'V')
+
+            # Lamp power (off/on)
+            self.lpp.add_digital_input(self.lamp_p_out(), 'LP')
+            # First lamp dimmer level
+            self.lpp.add_digital_output(pycom.nvs_get('lamp_lvl'), 'LD')
+            # Second lamp dimmer level
+            self.lpp.add_digital_output(pycom.nvs_get('lamp2_lvl'), 'Ld')
+
+            # Ambient Light Sensor
+            self.lpp.add_luminosity(self.adc_als(), 'L')
+
+            # Tilt sensor
+            if self.tilt_sensor:
+                self.lpp.add_accelerometer(self.tilt[0], self.tilt[1], self.tilt[2], 'y')
+            else:
+                self.lpp.payload_chan_skip('y')
+
+            # Line voltage
+            if self.meter_v1 > 0:
+                self.lpp.add_voltage(self.meter_v1, 'V')
+            else:
+                self.lpp.payload_chan_skip('V')
+            if pycom.nvs_get('meter_report'):
+                # Load voltage
+                if self.meter_v2 >= 0:
+                    self.lpp.add_voltage(self.meter_v2, 'V1')
+                else:
+                    self.lpp.payload_chan_skip('V1')
+                # Load current
+                if self.meter_c1 >= 0:
+                    self.lpp.add_current(self.meter_c1, 'C1')
+                else:
+                    self.lpp.payload_chan_skip('C1')
+                # Circuit current
+                if self.meter_c2 >= 0:
+                    self.lpp.add_current(self.meter_c2, 'C')
+                else:
+                    self.lpp.payload_chan_skip('C')
+            else:
+                self.lpp.payload_chan_skip('V1')
+                self.lpp.payload_chan_skip('C1')
+                self.lpp.payload_chan_skip('C')
+            self.reset_meter_cma()
+
+            # GNSS (latitude, longitude, HDOP)
+            # Only report if enabled and we have good accuracy.
+            if self.gps_report and 0.0 < self.gps_hdop <= 2.0:
+                self.lpp.add_gps(self.gps_lat, self.gps_lon, self.gps_hdop, 'LaLoLh')
+            else:
+                self.lpp.payload_chan_skip('LaLoLh')
+
+            # Status message frequency
+            self.lpp.add_generic(pycom.nvs_get('stat_freq'), 'S')
+
+            # Lamp on threshold
+            self.lpp.add_generic(pycom.nvs_get('lamp_th_on'), 'LT')
+            # Lamp off threshold
+            self.lpp.add_generic(pycom.nvs_get('lamp_th_off'), 'Lt')
+
+            # Tilt threshold
+            self.lpp.add_generic(pycom.nvs_get('tilt_th'), 'TT')
+
+            # Line Voltage High (swell) threshold
+            self.lpp.add_generic(pycom.nvs_get('meter_th_hi'), 'VT')
+            # Line Voltage Low (sag) threshold
+            self.lpp.add_generic(pycom.nvs_get('meter_th_lo'), 'Vt')
+
+            # WiFi promiscuous mode (off/on)
+            self.lpp.add_digital_input(pycom.nvs_get('sniffing'), 'FF')
+
+            # Bluetooth URIBeacon adverts (off/on)
+            self.lpp.add_digital_input(self.beacon.enabled(), 'BB')
+
+            # Firmware version
+            self.lpp.add_generic(int(FW_VER), 'v')
+
+            # Comm board variant.  If this field is omitted, the server assumes
+            # it's a COMLORA.
+            #
+            # b == 0 was the now-retired COMLTESW.
+            if MACH.lower() == 'comlteub':
+                self.lpp.add_generic(1, 'b')
+            elif MACH.lower() == 'comlteqt':
+                self.lpp.add_generic(2, 'b')
+            else:
+                self.lpp.payload_chan_skip('b')
+
+            # Radio access technology
+            if self.rat:
+                self.lpp.add_generic(self.rat, 'Ra')
+            else:
+                self.lpp.payload_chan_skip('Ra')
+
+            # Radio signal quality (RSSI, RSRQ)
+            if self.csq and 'rssi' in self.csq:
+                self.lpp.add_generic(self.csq['rssi'], 'Rq')
+            else:
+                self.lpp.payload_chan_skip('Rq')
+
+
+            # The remainder here are third-party sensors.
+
+            # Gun Shot Detector
+            if 'a' in self.gsd_data:
+                self.lpp.add_generic(int(self.gsd_data['a']), 'Ga')
+                del self.gsd_data['a']
+            else:
+                self.lpp.payload_chan_skip('Ga')
+            if 'm' in self.gsd_data:
+                self.lpp.add_generic(int(self.gsd_data['m']), 'Gm')
+                del self.gsd_data['m']
+            else:
+                self.lpp.payload_chan_skip('Gm')
+
+            # Aeroqual AQY / uRADMonitor A3
+            if 'TEMP' in self.aq_data:
+                self.lpp.add_temperature(float(self.aq_data['TEMP']), 'AT')
+                del self.aq_data['TEMP']
+            else:
+                self.lpp.payload_chan_skip('AT')
+            if 'RH' in self.aq_data:
+                self.lpp.add_relative_humidity(float(self.aq_data['RH']), 'AH')
+                del self.aq_data['RH']
+            else:
+                self.lpp.payload_chan_skip('AH')
+            if 'DP' in self.aq_data:
+                self.lpp.add_temperature(float(self.aq_data['DP']), 'AD')
+                del self.aq_data['DP']
+            else:
+                self.lpp.payload_chan_skip('AD')
+            if 'pressure' in self.aq_data:
+                self.lpp.add_barometric_pressure(float(self.aq_data['pressure']), 'AP')
+                del self.aq_data['pressure']
+            else:
+                self.lpp.payload_chan_skip('AP')
+            if 'O3' in self.aq_data:
+                self.lpp.add_generic(float(self.aq_data['O3']), 'AO')
+                del self.aq_data['O3']
+            else:
+                self.lpp.payload_chan_skip('AO')
+            no2 = None
+            if 'NO2' in self.aq_data:
+                no2 = self.aq_data['NO2']
+                del self.aq_data['NO2']
+            elif 'cNO2' in self.aq_data:
+                no2 = self.aq_data['cNO2']
+                del self.aq_data['cNO2']
+            if no2 is not None:
+                self.lpp.add_generic(float(no2), 'AN')
+            else:
+                self.lpp.payload_chan_skip('AN')
+            pm2 = None
+            if 'PM2.5' in self.aq_data:
+                pm2 = self.aq_data['PM2.5']
+                del self.aq_data['PM2.5']
+            elif 'cPM2.5' in self.aq_data:
+                pm2 = self.aq_data['cPM2.5']
+                del self.aq_data['cPM2.5']
+            if pm2 is not None:
+                self.lpp.add_generic(float(pm2), 'A2')
+            else:
+                self.lpp.payload_chan_skip('A2')
+            pm10 = None
+            if 'PM10' in self.aq_data:
+                pm10 = self.aq_data['PM10']
+                del self.aq_data['PM10']
+            elif 'cPM10' in self.aq_data:
+                pm10 = self.aq_data['cPM10']
+                del self.aq_data['cPM10']
+            if pm10 is not None:
+                self.lpp.add_generic(float(pm10), 'A0')
+            else:
+                self.lpp.payload_chan_skip('A0')
+            pm1 = None
+            if 'PM1' in self.aq_data:
+                pm1 = self.aq_data['PM1']
+                del self.aq_data['PM1']
+            if pm1 is not None:
+                self.lpp.add_generic(float(pm1), 'A1')
+            else:
+                self.lpp.payload_chan_skip('A1')
+            co2 = None
+            if 'co2' in self.aq_data:
+                co2 = self.aq_data['co2']
+                del self.aq_data['co2']
+            if co2 is not None:
+                self.lpp.add_generic(co2, 'Ao')
+            else:
+                self.lpp.payload_chan_skip('Ao')
+            ch2o = None
+            if 'ch2o' in self.aq_data:
+                ch2o = self.aq_data['ch2o']
+                del self.aq_data['ch2o']
+            if ch2o is not None:
+                self.lpp.add_generic(ch2o, 'AF')
+            else:
+                self.lpp.payload_chan_skip('AF')
+            voc = None
+            if 'voc' in self.aq_data:
+                voc = self.aq_data['voc']
+                del self.aq_data['voc']
+            if voc is not None:
+                self.lpp.add_generic(voc, 'AV')
+            else:
+                self.lpp.payload_chan_skip('AV')
+            noise = None
+            if 'noise' in self.aq_data:
+                noise = self.aq_data['noise']
+                del self.aq_data['noise']
+            if noise is not None:
+                self.lpp.add_generic(float(noise), 'An')
+            else:
+                self.lpp.payload_chan_skip('An')
+        except IndexError:
+            # Tried to add undefined channel.
+            raise
+        except:
+            # Payload at max size.
+            # Pick up the other sensors on subsequent calls.
+            self.lpp_segment += 1
+
+    def _gps_updated_cb(self, lte):
+        g = lte.gps()
+        if (self.rtc_jamset or not self.rtc_set) and g[0] and g[9]:
+            # Year, month, day.
+            self.rtc_set = [2000 + int(g[9][4:6]), int(g[9][2:4]), int(g[9][0:2])]
+            # Hour, minute, second.
+            self.rtc_set.extend([int(g[0][0:2]), int(g[0][2:4]), int(g[0][4:6])])
+            # Microseconds.
+            self.rtc_set.append(int(g[0][7:]) * 1000000)
+            # Timezone (UTC).
+            self.rtc_set.append(None)
+
+            self.rtc_set = tuple(self.rtc_set)
+            self.rtc_jamset = False
+            self.rtc.init(self.rtc_set)
+        self.gps_fix = g[5]
+        if self.gps_fix > 1:
+            self.gps_sats = g[10]
+            self.cur_gps_lat = g[1]
+            self.cur_gps_lon = g[2]
+            self.cur_gps_hdop = g[3]
+            if self.store_gps(self.cur_gps_lat, self.cur_gps_lon, self.cur_gps_hdop):
+                self.gps_report = pycom.nvs_get('gps_report')
+
+    def store_gps(self, lat, lon, hdop):
+        if 0.0 <= hdop > 10.0:
+            return False
+
+        if self.gps_hdop == 0.0 or hdop < self.gps_hdop:
+            saved_lat = pycom.nvs_get('gps_lat')
+            saved_lon = pycom.nvs_get('gps_lon')
+            saved_hdop = pycom.nvs_get('gps_hdop')
+
+            # New location same as stored location to within 3 decimal places?
+            if int(saved_lat / 1000) != int(lat * 1000) or int(saved_lon / 1000) != int(lon * 1000):
+                # No, ignore saved location.
+                saved_hdop = 500.0
+            else:
+                # Yes, convert back to floats.
+                saved_lat /= 1000000
+                saved_lon /= 1000000
+                saved_hdop /= 10
+
+            if hdop < saved_hdop:
+                log.debug('GNSS: Saving new location data.')
+                self.gps_lat = lat
+                self.gps_lon = lon
+                self.gps_hdop = hdop
+                pycom.nvs_set('gps_lat', int(self.gps_lat * 1000000))
+                pycom.nvs_set('gps_lon', int(self.gps_lon * 1000000))
+                pycom.nvs_set('gps_hdop', int(self.gps_hdop * 10))
+                return True
+            elif self.gps_hdop == 0.0:
+                log.debug('GNSS: Restoring saved location data.')
+                self.gps_lat = saved_lat
+                self.gps_lon = saved_lon
+                self.gps_hdop = saved_hdop
+                return True
+
+        return False
+
+    def run(self):
+        tx_err = 0
+
+        promisc_channel = 1
+
+        ext_sensor_chrono = Timer.Chrono()
+        ext_sensor_chrono.start()
+        csq_chrono = Timer.Chrono()
+        csq_chrono.start()
+        status_chrono = Timer.Chrono()
+        status_chrono.start()
+        gc_chrono = Timer.Chrono()
+        gc_chrono.start()
+        conn_chrono = Timer.Chrono()
+        conn_chrono.start()
+        ping_chrono = Timer.Chrono()
+        ping_chrono.start()
+        promisc_chrono = Timer.Chrono()
+        promisc_chrono.start()
+        wifijoin_chrono = Timer.Chrono()
+        wifijoin_chrono.start()
+
+        if self.lorawan:
+            # Force a Join Request every 12 hours + rand val to
+            # stagger the joins across the nodes.
+            #
+            # If the gateway is repointed to a new LoRaServer, the
+            # frame counters will be off.  Sending the Join Request
+            # periodically will reset this.
+            lora_rejoin_freq = 43200 + randint(0, 599)
+            lora_rejoin_chrono = Timer.Chrono()
+            lora_rejoin_chrono.start()
+
+        while True:
+            # Scan for possible WiFi networks to connect to.
+            if not self.wifi.isconnecting() and wifijoin_chrono.read() > self.wifi.CONN_TIMEOUT:
+                wifijoin_chrono.reset()
+                if self.wifi.join() == 2 and self.lte:
+                    # Connecting to WiFi network that provides internet access.
+                    log.info('Disabling LTE while connected to WiFi network.')
+                    self.lte.disconnect()
+                    self.lte_conn_delay = self.wifi.CONN_TIMEOUT * 2
+
+            # GNSS (time and location).
+            #
+            # Process at most 500 characters per loop iteration to prevent
+            # hanging here if something is wrong with the GNSS module and
+            # it's being overly talkative.
+            #
+            # Quectel LTE module has on-board GNSS, and is handled in callback.
+            gn = 0
+            while self.mpy_gps and gn < 500 and \
+                    (self.gps_i2c or (self.gps_uart and self.gps_uart.any())):
+                x = None
+                try:
+                    if self.gps_i2c:
+                        x = self.i2c.readfrom(0x10, 255)
+                    else:
+                        x = self.gps_uart.read(255)
+                except:
+                    pass
+
+                if not x:
+                    break
+
+                for c in x:
+                    gn += 1
+                    s = self.mpy_gps.update(chr(c))
+                    if s and self.mpy_gps.satellite_data_updated():
+                        self.gps_fix = self.mpy_gps.fix_type
+                        self.cur_gps_hdop = self.mpy_gps.hdop
+                        if s[2:] == 'GLL':
+                            self.cur_gps_lat = self.mpy_gps.latitude[0]
+                            if self.mpy_gps.latitude[1] == 'S' and self.cur_gps_lat > 0.0:
+                                self.cur_gps_lat = -self.cur_gps_lat
+                            self.cur_gps_lon = self.mpy_gps.longitude[0]
+                            if self.mpy_gps.longitude[1] == 'W' and self.cur_gps_lon > 0.0:
+                                self.cur_gps_lon = -self.cur_gps_lon
+                            if self.gps_fix > 1:
+                                if self.store_gps(self.cur_gps_lat, self.cur_gps_lon, self.cur_gps_hdop):
+                                    self.gps_report = pycom.nvs_get('gps_report')
+                        if self.gps_sats != self.mpy_gps.satellites_visible():
+                            if s[2:] == 'GSA' or s[2:] == 'GSV':
+                                self.gps_sats = self.mpy_gps.satellites_visible()
+                        if (self.rtc_jamset or not self.rtc_set) and self.mpy_gps.date[0] != 0:
+                            # Year, month, day.
+                            self.rtc_set = [2000 + self.mpy_gps.date[2], self.mpy_gps.date[1], self.mpy_gps.date[0]]
+                            # Hour, minute, second.
+                            self.rtc_set.extend([self.mpy_gps.timestamp[0], self.mpy_gps.timestamp[1], int(self.mpy_gps.timestamp[2])])
+                            # Microseconds.
+                            self.rtc_set.append(int((self.mpy_gps.timestamp[2] - int(self.mpy_gps.timestamp[2])) * 1000000))
+                            # Timezone (UTC).
+                            self.rtc_set.append(None)
+
+                            self.rtc_set = tuple(self.rtc_set)
+                            self.rtc_jamset = False
+                            log.info('RTC: Set from GNSS to UTC {}'.format(self.rtc_set))
+                            self.rtc.init(self.rtc_set)
+
+            # Set RTC from NTP if GNSS not available.
+            if self.gps_fix < 2:
+                if NTP_SERVER and not self.ntp_syncing:
+                    log.info('RTC: Sync using {}...'.format(NTP_SERVER))
+                    self.rtc.ntp_sync(NTP_SERVER)
+                    self.ntp_syncing = True
+            elif self.ntp_syncing:
+                log.info('RTC: Disabling NTP sync.')
+                self.rtc.ntp_sync(None)
+                self.ntp_syncing = False
+            if (self.rtc_jamset or not self.rtc_set) and self.rtc.synced():
+                self.rtc_set = self.rtc.now()
+                self.rtc_jamset = False
+                log.info('RTC: Set from NTP to UTC {}'.format(self.rtc_set))
+
+            # Autonomous light control.
+            lth_on = pycom.nvs_get('lamp_th_on')
+            lth_off = pycom.nvs_get('lamp_th_off')
+            # If thresholds are equal, disable autonomous light control.
+            if lth_on != lth_off:
+                if self.adc_als() <= lth_on:
+                    # Day-to-night transition.
+                    if pycom.nvs_get('lamp_latch'):
+                        # Currently latched.  Only release if latched during the day.
+                        if not pycom.nvs_get('lamp_latch_n'):
+                            pycom.nvs_set('lamp_latch', 0)
+                            log.debug('Lamp latch released.')
+                    if not pycom.nvs_get('lamp_latch'):
+                        if not self.lamp_p_out():
+                            log.debug('ALS: Good night.')
+                            self.rtc_jamset = True
+                        self.lamp_toggle(1, latch=False)
+                elif self.adc_als() >= lth_off:
+                    # Night-to-day transition.
+                    if pycom.nvs_get('lamp_latch'):
+                        # Currently latched.  Only release if latched during the night.
+                        if pycom.nvs_get('lamp_latch_n'):
+                            pycom.nvs_set('lamp_latch', 0)
+                            log.debug('Lamp latch released.')
+                    if not pycom.nvs_get('lamp_latch'):
+                        if self.lamp_p_out():
+                            log.debug('ALS: Good morning.')
+                            self.rtc_jamset = True
+                        self.lamp_toggle(0, latch=False)
+
+            # Tilt sensor.
+            try:
+                self.tilt = self.tilt_sensor.acceleration
+            except Exception as e:
+                log.error('LIS2HH12: ' + repr(e))
+            else:
+                if pycom.nvs_get('tilt_th') > 0:
+                    from math import atan2, sqrt, degrees
+                    def to_phi(x, y, z):
+                        atang = atan2(-x, sqrt(x**2 + y**2 + z**2))
+                        return degrees(atang)
+                    def to_theta(x, y, z):
+                        atang = atan2(y, z)
+                        return degrees(atang)
+                    pdc = to_phi(self.tilt[0], self.tilt[1], self.tilt[2])
+                    tdc = to_theta(self.tilt[0], self.tilt[1], self.tilt[2])
+                    pdl = to_phi(self.tilt_last[0], self.tilt_last[1], self.tilt_last[2])
+                    tdl = to_theta(self.tilt_last[0], self.tilt_last[1], self.tilt_last[2])
+                    if abs(max(abs(pdc), abs(tdc)) - max(abs(pdl), abs(tdl))) > pycom.nvs_get('tilt_th'):
+                        log.warning('Device tilted!  phi={}, theta={}.'.format(pdc, tdc))
+                        self.report_asap = True
+                self.tilt_last = self.tilt
+
+            # Lamp scheduling.
+            if self.rtc_set:
+                if not self.sched_init:
+                    log.info('Schedule: Initializing...')
+                    try:
+                        n_scheds = 0
+                        with open('crontab.txt', 'r') as f:
+                            for line in f.readlines():
+                                # Ignore lines that don't start with a digit.
+                                if 48 <= ord(line[0]) <= 57:
+                                    log.debug('Schedule: {}'.format(line.rstrip()))
+                                    gc.collect()
+                                    if n_scheds < 8:
+                                        self.cron_str_to_schedule(line.rstrip())
+                                        n_scheds += 1
+                                    else:
+                                        log.warning('Schedule: Too many entries, truncating.')
+                                        break
+                        log.info('Schedule: Initialized.')
+                        gc.collect()
+                        schedule.run_to_now()
+                    except:
+                        log.error('Schedule: Failed to initialize.')
+                        try:
+                            # Clear schedules.
+                            self.cron_del()
+                        except Exception as e:
+                            log.error('Schedule: Del: ' + repr(e))
+                    else:
+                        self.sched_init = True
+                else:
+                    try:
+                        schedule.run_pending()
+                    except Exception as e:
+                        log.error('Schedule: Run: ' + repr(e))
+
+            # Meter readings.
+            if self.stpm:
+                try:
+                    m_v1, m_c1, m_v2, m_c2 = self.stpm.read()
+                except Exception as e:
+                    log.error('STPM34: ' + repr(e))
+                else:
+                    def cum_mov_avg(cma, count, newval):
+                        return (newval + (cma * count)) / (count + 1)
+
+                    # Power line detection.
+                    meter_th_hi = pycom.nvs_get('meter_th_hi')
+                    meter_th_lo = pycom.nvs_get('meter_th_lo')
+                    if m_v1 < 85:
+                        if self.meter_v1 > 0:
+                            log.warning('STPM34: Power loss detected: Line V:{}'.format(m_v1))
+                            # Report to broker 0V to indicate power loss.
+                            self.meter_v1 = 0
+                            # Reset payload progress to get this out ASAP.
+                            self.lpp_segment = 1
+                            self.lpp.reset_payload_chans()
+                            self.report_asap = True
+                    elif m_v1 >= meter_th_hi and self.meter_v1 < meter_th_hi:
+                        # Swell detected.
+                        log.warning('STPM34: Power swell detected: Line V:{}'.format(m_v1))
+                        self.meter_v1 = m_v1
+                        self.reset_meter_cma()
+                        self.report_asap = True
+                    elif m_v1 <= meter_th_lo and self.meter_v1 > meter_th_lo:
+                        # Sag detected.
+                        log.warning('STPM34: Power sag detected: Line V:{}'.format(m_v1))
+                        self.meter_v1 = m_v1
+                        self.reset_meter_cma()
+                        self.report_asap = True
+                    elif m_v1 >= 85: # Considered stable at 85V per Eugene Frenkel
+                        if self.meter_v1 == 0:
+                            log.info('STPM34: Power restored: Line V:{}'.format(m_v1))
+                            self.reset_meter_cma()
+                            self.report_asap = True
+
+                        self.cma_meter_v1 = cum_mov_avg(self.cma_meter_v1, self.cma_meter_count, m_v1)
+                        self.cma_meter_c1 = cum_mov_avg(self.cma_meter_c1, self.cma_meter_count, m_c1)
+                        self.cma_meter_v2 = cum_mov_avg(self.cma_meter_v2, self.cma_meter_count, m_v2)
+                        self.cma_meter_c2 = cum_mov_avg(self.cma_meter_c2, self.cma_meter_count, m_c2)
+                        self.cma_meter_count += 1
+
+                        if self.lpp_segment == 1:
+                            # Latch values until complete payload is transmitted, so
+                            # all segments are referring to the same data sample.
+                            self.meter_v1 = self.cma_meter_v1
+                            self.meter_c1 = self.cma_meter_c1
+                            self.meter_v2 = self.cma_meter_v2
+                            self.meter_c2 = self.cma_meter_c2
+
+            # External sensor readings.
+            if ext_sensor_chrono.read() >= 10 and self.lpp_segment == 1:
+                ext_sensor_chrono.reset()
+                try:
+                    wigw = self.wifi.get_cfg()[2]
+                except:
+                    pass
+                else:
+                    self._read_ext_sensors(wigw)
+
+            # Query modem stats.
+            if self.lte and self.lte.isconnected():
+                csq_freq = 300
+                if MACH.lower() == 'comlteqt' and pycom.nvs_get('gps_report') and not self.gps_report:
+                    # If we're getting GNSS from the LTE module, query more
+                    # frequently until we get a fix.
+                    csq_freq = 60
+                if csq_chrono.read() >= csq_freq:
+                    csq_chrono.reset()
+                    if MACH.lower() != 'comlteub':
+                        # UBI-XXX: SARA-R4 modem can potentially hang
+                        # permanently when switching to and from online
+                        # command mode, so disable for now.
+                        self.lte.read_stats()
+
+            # LTE/LoRa radio signal strength.
+            if self.lte:
+                try:
+                    self.rat = self.lte.access_technology()
+                    self.csq = self.lte.signal_quality(['rssi', 'rsrq'])
+                except Exception as e:
+                    log.error('Error querying LTE signal quality: ' + repr(e))
+            elif self.lorawan:
+                try:
+                    self.rat = self.lorawan.access_technology()
+                    # Don't need to report this for LoRa any more.
+                    #self.csq = self.lorawan.signal_quality()
+                except Exception as e:
+                    log.error('Error querying LoRa signal quality: ' + repr(e))
+
+            # Radio connections.
+            #
+            # LTE and WiFi are handled in their own classes.
+            if self.lorawan:
+                if lora_rejoin_chrono.read() > lora_rejoin_freq:
+                    #lora_rejoin_chrono.reset()
+                    #self.lorawan.init()
+                    # The above should work, but the stack doesn't reset
+                    # cleanly some times, so let's just brute-force it.
+                    if not self.fw_upd_lock.locked():
+                        log.info('Rejoin timer expired.')
+                        lora_rejoin_chrono.reset()
+                        self.reboot()
+                elif not self.lorawan.lora.has_joined():
+                    self.lora_joined = False
+                    self.lorawan.join()
+                elif not self.lora_joined:
+                    self.lora_joined = True
+                    self.report_asap = True
+            if self.lte:
+                if self.mqttc and self.mqttc.isconnected() \
+                        and not self.wifi.isconnected_inet() \
+                        and not self.lte.isconnected():
+                    try:
+                        self.mqttc.disconnect()
+                    except:
+                        pass
+                    finally:
+                        log.warning('MQTT: Disconnected.')
+                if self.lte_conn_delay > 0:
+                    self.lte_conn_delay -= 1
+                # Only try to connect via LTE if WiFi doesn't provide inet access.
+                if not self.wifi.isconnecting() and not self.wifi.isconnected_inet() \
+                        and self.lte_conn_delay == 0:
+                    self.lte.connect()
+
+            # MQTT connection.
+            if self.lorawan and self.mqttc and self.mqttc.isconnected() and not self.wifi.isconnected_inet():
+                # Close MQTT connection if LoRa unit and WiFi disappeared.
+                try:
+                    self.mqttc.disconnect()
+                except:
+                    pass
+                finally:
+                    log.warning('MQTT: Disconnected.')
+            if self.wifi.isconnected_inet() or (self.lte and self.lte.isconnected()):
+                if self.mqttc and not self.mqttc.isconnected():
+                    import socket
+                    ndns = 0
+                    if self.dns_pri:
+                        socket.dnsserver(ndns, self.dns_pri)
+                        ndns += 1
+                    if self.dns_sec:
+                        socket.dnsserver(ndns, self.dns_sec)
+                        ndns += 1
+                    log.debug('DNS: {}'.format(socket.dnsserver()))
+
+                    log.debug('MQTT: Connecting to {}:{}...'.format(self.mqtt_addr, self.mqtt_port))
+                    tx_err += 1
+                    try:
+                        self.mqttc.connect(False)
+                    except OSError as e:
+                        log.error('MQTT: Unable to connect to {}:{}, {}'.format(self.mqtt_addr, self.mqtt_port, repr(e)))
+                        if e.errno == -1 or e.errno == 11 or e.errno == 118:
+                            # Workaround for a routing bug when two interfaces are online
+                            # and one disappears.  Allows a reconnection attempt to WiFi
+                            # before trying to bring up LTE interface again.
+                            if self.wifi.isconnected_inet():
+                                self.wifi.disconnect()
+                            if self.lte:
+                                self.lte.disconnect()
+                            self.lte_conn_delay = self.wifi.CONN_TIMEOUT * 2
+                    except Exception as e:
+                        log.error('MQTT: Unable to connect to {}:{}, {}'.format(self.mqtt_addr, self.mqtt_port, repr(e)))
+                    else:
+                        try:
+                            self.mqttc.subscribe(self.MQTT_TOP_SUB, MQTT_QOS_SUB)
+                        except Exception as e:
+                            log.error('MQTT: subscribe: ' + repr(e))
+                            try:
+                                self.mqttc.disconnect()
+                            except:
+                                pass
+                        else:
+                            log.info('MQTT: Connected to {}:{}'.format(self.mqtt_addr, self.mqtt_port))
+                            self.report_asap = True
+                            csq_chrono.reset()
+                            ping_chrono.reset()
+                            tx_err -= 1
+
+            # If using MQTT and connected to broker, don't process messages
+            # coming in from other LoRa interface.
+            if self.lorawan:
+                if self.mqttc and self.mqttc.isconnected():
+                    self.lorawan.set_rx_callback(None)
+                else:
+                    self.lorawan.set_rx_callback(self._rx_control_cb)
+
+            # Report frequency.
+            if self.wifi.isconnected_inet() or self.lpp_segment > 1:
+                # If connected via WiFi or this is a segment of a previous
+                # payload, send as fast as we can.
+                stat_freq = clamp_stat_freq(1)
+            else:
+                stat_freq = pycom.nvs_get('stat_freq')
+
+            # MQTT heartbeat (ping) frequency.
+            mqtt_ping = pycom.nvs_get('mqtt_ping')
+
+            # Status message.
+            packet_tx = False
+            # Alternate status messages (e.g., sniffed WiFi MAC addresses).
+            alt_payload = self.build_mac_msg()
+            if alt_payload or self.report_asap or status_chrono.read() >= stat_freq:
+                self.prune_macs()
+                try:
+                    if not alt_payload:
+                        self.build_status_msg()
+                    gc.collect()
+                except Exception as e:
+                    log.error('Error building status message: ' + repr(e))
+                else:
+                    if self.mqttc and self.mqttc.isconnected():
+                        if (self.lte and self.lte.isready()) or self.wifi.isconnected_inet():
+                            try:
+                                log.debug('MQTT: Publishing message...')
+                                self.mqttc.publish(self.MQTT_TOP_PUB, self.lpp.get_payload(), qos=MQTT_QOS_PUB)
+                            except Exception as e:
+                                log.error('MQTT: publish: ' + repr(e))
+                                tx_err += 1
+                                try:
+                                    self.mqttc.disconnect()
+                                except:
+                                    pass
+                            else:
+                                packet_tx = True
+                    elif self.lorawan:
+                        status_chrono.reset()
+                        if self.lorawan.lora.has_joined():
+                            try:
+                                self.lorawan.sock.send(self.lpp.get_payload())
+                            except Exception as e:
+                                log.error('TX: ' + repr(e))
+                                tx_err += 1
+                            else:
+                                packet_tx = True
+                    elif not self.lte:
+                        # Simulated -- no radio configured.
+                        packet_tx = True
+                    else:
+                        # No connection to peer.
+                        status_chrono.reset()
+
+            if packet_tx:
+                log.debug('TX: {}'.format(self.lpp.decode()))
+                if not alt_payload:
+                    self.report_asap = False
+                    status_chrono.reset()
+                ping_chrono.reset()
+                tx_err = 0
+            elif mqtt_ping > 0 and ping_chrono.read() >= mqtt_ping:
+                if self.mqttc and self.mqttc.isconnected():
+                    if (self.lte and self.lte.isready()) or self.wifi.isconnected_inet():
+                        try:
+                            log.debug('MQTT: Ping...')
+                            self.mqttc.ping()
+                            ping_chrono.reset()
+                        except Exception as e:
+                            log.error('MQTT: ping: ' + repr(e))
+                            tx_err += 1
+                            try:
+                                self.mqttc.disconnect()
+                            except:
+                                pass
+
+            # Read and process any incoming control messages.
+            #
+            # LoRa comes in via callback.
+            if self.mqttc and self.mqttc.isconnected():
+                try:
+                    self.mqttc.check_msg()
+                except Exception as e:
+                    log.error('MQTT: check_msg: ' + repr(e))
+                    try:
+                        self.mqttc.disconnect()
+                    except:
+                        pass
+
+            # Garbage collection and periodic debug messages.
+            if gc_chrono.read() >= 10:
+                gc_chrono.reset()
+                gc.collect()
+                gc.threshold(gc.mem_free() // 4 + gc.mem_alloc())
+                #import micropython
+                #micropython.mem_info(1)
+                log.info('Free memory: {} bytes'.format(gc.mem_free()))
+                if self.lte:
+                    # This looks backward, but the LTE lib reports rx and tx
+                    # count from the perspective of the modem.
+                    log.debug('LTE: rx:{} tx:{}'.format(self.lte.tx_count(), self.lte.rx_count()))
+                log.debug('TX error count={}'.format(tx_err))
+                if self.stpm:
+                    try:
+                        m_v1, m_c1, m_v2, m_c2 = self.stpm.read()
+                    except Exception as e:
+                        log.error('STPM34: ' + repr(e))
+                    else:
+                        log.debug('STPM34: Instant: Load V:{}, Load C:{}, Line V:{}, Circuit C:{}'.format(m_v2, m_c1, m_v1, m_c2))
+                        log.debug('STPM34: Average: Load V:{}, Load C:{}, Line V:{}, Circuit C:{}'.format(self.cma_meter_v2, self.cma_meter_c1, self.cma_meter_v1, self.cma_meter_c2))
+                if self.tilt_sensor:
+                    log.debug('LIS2HH12: Accel:{}'.format(self.tilt))
+                log.debug('GNSS: Satellites in view: {}'.format(self.gps_sats if self.gps_sats else 'None'))
+                if self.gps_fix > 1:
+                    if self.mpy_gps:
+                        log.debug('GNSS: {}/{} satellites used in current solution: {}'.format(len(self.mpy_gps.satellites_used), self.mpy_gps.satellites_in_use, self.mpy_gps.satellites_used))
+                    elif MACH.lower() == 'comlteqt':
+                        log.debug('GNSS: {} satellites used.'.format(self.gps_sats))
+                    log.debug('GNSS: {} fix'.format('2D' if self.gps_fix == 2 else '3D'))
+                    log.debug('GNSS: La={} Lo={} HDOP={}'.format(self.cur_gps_lat, self.cur_gps_lon, self.cur_gps_hdop))
+                    log.debug('GNSS: Using La={} Lo={} HDOP={}'.format(self.gps_lat, self.gps_lon, self.gps_hdop))
+                if self.rtc_set:
+                    log.info('RTC: Current time is UTC {}'.format(self.rtc.now()))
+                    log.debug('RTC: Last jam set @ UTC {}'.format(self.rtc_set))
+
+            # Failsafe for radio modules.
+            #
+            # If we don't get a backhaul connection for over one hour or we've
+            # gotten too many transmission errors (LoRaWAN only), let's reboot
+            # the machine just in case the radio module is hung.
+            #
+            # Note that if the lamp is not currently on, we can time out here
+            # more frequently as there won't be a visual disturbance from the
+            # ground.
+            failsafe_timeout = 3600
+            if not self.lamp_p_out():
+                failsafe_timeout = 600
+            if self.wifi.isconnected_inet() \
+                    or (self.lorawan and self.lorawan.lora.has_joined() and tx_err < 5) \
+                    or (self.lte and self.lte.isconnected() and tx_err < 5):
+                conn_chrono.reset()
+            elif conn_chrono.read() > failsafe_timeout or (self.lorawan and tx_err >= 5):
+                if not self.fw_upd_lock.locked():
+                    log.info('Unable to communicate with peer for too long!')
+                    conn_chrono.reset()
+                    tx_err = 0
+                    self.reboot()
+
+            if pycom.nvs_get('sniffing') and promisc_chrono.read() >= 1:
+                self.wifi.wlan.channel(promisc_channel)
+                promisc_channel = (promisc_channel + 1) % 12
+                if promisc_channel == 0:
+                    promisc_channel = 1
+                promisc_chrono.reset()
+
+            if not self.reboot_lock.locked():
+                self.wdt.feed()
+
+            # Firmware update requested?
+            # UBI-XXX: Should be on a thread.
+            if self.fw_upd_lock.acquire():
+                url = self.fw_upd_url
+                self.fw_upd_url = None
+                self.fw_upd_lock.release()
+                if url:
+                    log.info('Checking for firmware update...')
+
+                    # Give it two hours to finish.
+                    self.wdt.init(timeout=7200000)
+                    self.wdt.feed()
+
+                    try:
+                        if not self.fw_update(url):
+                            log.info('No new firmware version available.')
+                            self.wdt.init(timeout=WD_TIMEOUT)
+                        else:
+                            log.info('Firmware update successful.')
+                            self.reboot()
+                    except:
+                        self.reboot()
+                        raise
+
+            time.sleep(1)
